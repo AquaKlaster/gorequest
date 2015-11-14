@@ -19,6 +19,8 @@ import (
 	"time"
 
 	"golang.org/x/net/publicsuffix"
+	"golang.org/x/net/proxy"
+	"encoding/base64"
 )
 
 type Request *http.Request
@@ -54,6 +56,7 @@ type SuperAgent struct {
 	BasicAuth         struct{ Username, Password string }
 	Debug             bool
 	logger            *log.Logger
+	timeoutDial       func(network, addr string) (net.Conn, error)
 }
 
 // Used to create a new SuperAgent object.
@@ -321,7 +324,7 @@ func (s *SuperAgent) Param(key string, value string) *SuperAgent {
 }
 
 func (s *SuperAgent) Timeout(timeout time.Duration) *SuperAgent {
-	s.Transport.Dial = func(network, addr string) (net.Conn, error) {
+	s.timeoutDial = func(network, addr string) (net.Conn, error) {
 		conn, err := net.DialTimeout(network, addr, timeout)
 		if err != nil {
 			s.Errors = append(s.Errors, err)
@@ -329,6 +332,9 @@ func (s *SuperAgent) Timeout(timeout time.Duration) *SuperAgent {
 		}
 		conn.SetDeadline(time.Now().Add(timeout))
 		return conn, nil
+	}
+	if s.Transport.Dial == nil {
+		s.Transport.Dial = s.timeoutDial
 	}
 	return s
 }
@@ -343,6 +349,13 @@ func (s *SuperAgent) Timeout(timeout time.Duration) *SuperAgent {
 func (s *SuperAgent) TLSClientConfig(config *tls.Config) *SuperAgent {
 	s.Transport.TLSClientConfig = config
 	return s
+}
+
+func (s *SuperAgent) Dial(network, addr string) (net.Conn, error) {
+	if s.timeoutDial == nil {
+		return net.Dial(network, addr)
+	}
+	return s.timeoutDial(network, addr)
 }
 
 // Proxy function accepts a proxy url string to setup proxy url for any request.
@@ -367,8 +380,22 @@ func (s *SuperAgent) Proxy(proxyUrl string) *SuperAgent {
 		s.Errors = append(s.Errors, err)
 	} else if proxyUrl == "" {
 		s.Transport.Proxy = nil
-	} else {
+	} else if parsedProxyUrl.Scheme == "http" || parsedProxyUrl.Scheme == "https" {
 		s.Transport.Proxy = http.ProxyURL(parsedProxyUrl)
+		if parsedProxyUrl.User != nil {
+			user := parsedProxyUrl.User.Username()
+			pwd, _ := parsedProxyUrl.User.Password()
+			s = s.Set("Proxy-Authorization", "Basic " + base64.StdEncoding.EncodeToString([]byte(user + ":" + pwd)))
+		}
+	} else if parsedProxyUrl.Scheme == "socks5" {
+		dialer, err := proxy.FromURL(parsedProxyUrl, s)
+		if err != nil {
+			s.Errors = append(s.Errors, err)
+		} else {
+			s.Transport.Dial = dialer.Dial
+		}
+	} else {
+		s.Errors = append(s.Errors, errors.New("proxy: unknown scheme: " + parsedProxyUrl.Scheme))
 	}
 	return s
 }
